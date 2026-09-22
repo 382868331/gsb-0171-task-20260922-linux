@@ -1,0 +1,16 @@
+{
+  "description": "恒相位导频: 零频偏, 相位 0.6 rad, 单位幅度。期望 omega->0, theta->0.6, 最终 locked。",
+  "amplitude": 1.0,
+  "phase": 0.6,
+  "freq_offset": 0.0,
+  "n_samples": 400,
+  "params": {"kp": 0.2, "ki": 0.02, "wmax": 1.0, "amin": 0.5, "eps": 0.05, "lock_count": 20},
+  "expected": {
+    "omega": 0.0,
+    "theta": 0.6,
+    "locked": true,
+    "omega_tol": 1e-9,
+    "theta_tol": 1e-9,
+    "final_error_max": 1e-9
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "description": "固定频偏导频: 频偏 0.3 rad/sample, 初相 -1.2 rad, 单位幅度。期望 omega->0.3, 最终 locked, 末端残余误差收敛到 0。",
+  "amplitude": 1.0,
+  "phase": -1.2,
+  "freq_offset": 0.3,
+  "n_samples": 2000,
+  "params": {"kp": 0.1, "ki": 0.005, "wmax": 1.0, "amin": 0.5, "eps": 0.02, "lock_count": 50},
+  "expected": {
+    "omega": 0.3,
+    "locked": true,
+    "omega_tol": 1e-9,
+    "final_error_max": 1e-6
+  }
+}
