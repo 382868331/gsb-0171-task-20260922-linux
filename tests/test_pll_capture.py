@@ -22,6 +22,9 @@ from pll_capture import (
     PLLInputError,
     PLLParamError,
     PLLParams,
+    PLLSwitchError,
+    RateSwitchReport,
+    SamplePeriod,
     wrap_phase,
 )
 
@@ -289,6 +292,380 @@ class TestSampleValidation(unittest.TestCase):
         d = pll.step(1.0)  # 实数 -> 虚部 0
         self.assertTrue(d.valid)
         self.assertAlmostEqual(d.amplitude, 1.0, delta=1e-15)
+
+
+def physical_pilot(amplitude, phase0, freq_hz, ts, n):
+    """按物理时间确定性生成导频: z_k = A*exp(j*(phase0 + 2*pi*f*k*Ts))。
+
+    期望值(相位/频偏)由物理模型直接给出,不经过被测核心。
+    """
+    w = 2.0 * math.pi * freq_hz * ts  # rad/sample
+    return make_pilot(amplitude, phase0, w, n), w
+
+
+class TestSamplePeriod(unittest.TestCase):
+    def test_seconds_and_default(self):
+        sp = SamplePeriod.seconds(1.0 / 48000.0)
+        self.assertEqual(sp.unit, "seconds")
+        self.assertAlmostEqual(sp.to_seconds(), 1.0 / 48000.0, delta=1e-18)
+        self.assertEqual(SamplePeriod().to_seconds(), 1.0)
+        # 无量纲单位仅允许 1.0
+        sp2 = SamplePeriod(1.0, "samples")
+        self.assertEqual(sp2.to_seconds(), 1.0)
+
+    def test_bad_period_rejected(self):
+        for bad in (0.0, -1e-9, float("nan"), float("inf"), True, "1e-3", None):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(PLLParamError):
+                    SamplePeriod.seconds(bad)
+        with self.assertRaises(PLLParamError):
+            SamplePeriod(2.0, "samples")
+        with self.assertRaises(PLLParamError):
+            SamplePeriod(1.0, "weeks")
+
+    def test_params_ts_validation(self):
+        p = PLLParams(**GOOD, ts=SamplePeriod.seconds(2e-5))
+        self.assertAlmostEqual(p.ts.to_seconds(), 2e-5, delta=1e-20)
+        with self.assertRaises(PLLParamError):
+            PLLParams(**GOOD, ts=2e-5)
+        # 不传 ts 与传单位周期都不改变增益数值
+        self.assertEqual(PLLParams(**GOOD).kp, p.kp)
+        self.assertEqual(PLLParams(**GOOD).ki, p.ki)
+
+
+class TestRateSwitchAnalytic(unittest.TestCase):
+    """切换缩放的解析式核对(期望值全部手算,不用被测核心生成)。"""
+
+    def test_gain_frequency_phase_scaling_exact(self):
+        # r = 0.5(周期减半/采样率加倍): kp'=0.5kp, ki'=0.25ki,
+        # wmax'=0.5wmax, omega'=0.5omega, theta 数值不变。
+        params = PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5,
+                           ts=SamplePeriod.seconds(1.0))
+        pll = PLL(params, theta0=0.4, omega0=0.3)
+        theta_initial = pll.theta  # wrap_phase(0.4) 的双精度结果
+        pll._streak = 3  # 直接造一个非平凡计数(经属性核对用)
+        self.assertEqual(pll.streak, 3)
+        rep = pll.set_sample_period(SamplePeriod.seconds(0.5))
+        self.assertIsInstance(rep, RateSwitchReport)
+        # 手算期望值(0.3*0.5、0.02/4 等在二进制下为精确缩放)
+        self.assertEqual(rep.ratio, 0.5)
+        self.assertEqual(pll.params.kp, 0.1)
+        self.assertEqual(pll.params.ki, 0.005)
+        self.assertEqual(pll.params.wmax, 0.5)
+        self.assertEqual(pll.omega, 0.15)
+        self.assertAlmostEqual(pll.theta, 0.4, delta=1e-15)
+        self.assertEqual(pll.theta, theta_initial)
+        self.assertEqual(rep.theta_new, rep.theta_old)
+        self.assertEqual(rep.omega_new, 0.15)
+        self.assertEqual(rep.omega_old, 0.3)
+        # eps/amin/lock_count 与计数状态不随采样周期改变
+        self.assertEqual(pll.params.eps, 0.05)
+        self.assertEqual(pll.params.amin, 0.5)
+        self.assertEqual(pll.params.lock_count, 5)
+        self.assertEqual(pll.streak, 3)
+        self.assertFalse(pll.locked)
+        self.assertEqual(pll.processed, 0)
+        self.assertEqual(pll.sample_period_seconds, 0.5)
+        self.assertEqual(pll.sample_rate, 2.0)
+
+    def test_physical_dynamic_invariants(self):
+        # 连续化不变量: omega_n = sqrt(ki)/Ts (rad/s), zeta = kp/(2 sqrt(ki))。
+        ts1, ts2 = 1.0 / 48000.0, 1.0 / 24000.0  # r = 2
+        kp, ki = 0.12, 0.008
+        params = PLLParams(kp=kp, ki=ki, wmax=1.2, amin=0.2,
+                           eps=0.03, lock_count=20,
+                           ts=SamplePeriod.seconds(ts1))
+        pll = PLL(params, omega0=-0.07)
+        r = ts2 / ts1
+        pll.set_sample_period(SamplePeriod.seconds(ts2))
+        p1, p2 = params, pll.params
+        wn1 = math.sqrt(ki) / ts1
+        wn2 = math.sqrt(p2.ki) / ts2
+        zeta1 = kp / (2.0 * math.sqrt(ki))
+        zeta2 = p2.kp / (2.0 * math.sqrt(p2.ki))
+        self.assertAlmostEqual(wn2, wn1, delta=1e-7 * wn1)
+        self.assertAlmostEqual(zeta2, zeta1, delta=1e-12)
+        # 手算: kp'=0.24, ki'=0.032, omega'=-0.14
+        self.assertAlmostEqual(p2.kp, kp * r, delta=1e-15)
+        self.assertAlmostEqual(p2.ki, ki * r * r, delta=1e-15)
+        self.assertAlmostEqual(pll.omega, -0.14, delta=1e-15)
+
+    def test_physical_frequency_hz_invariant(self):
+        # omega(rad/sample)随周期缩放,物理频偏 Hz 不变。
+        ts1, ts2 = 1.0 / 48000.0, 1.0 / 96000.0  # r = 0.5
+        f_hz = 1500.0
+        w1 = 2.0 * math.pi * f_hz * ts1
+        params = PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.0,
+                           eps=0.2, lock_count=5,
+                           ts=SamplePeriod.seconds(ts1))
+        pll = PLL(params, omega0=w1)
+        self.assertAlmostEqual(pll.frequency_hz, f_hz, delta=1e-9)
+        rep = pll.set_sample_period(SamplePeriod.seconds(ts2))
+        self.assertAlmostEqual(pll.frequency_hz, f_hz, delta=1e-9)
+        self.assertAlmostEqual(rep.physical_frequency_hz, f_hz, delta=1e-9)
+        # 新频率字应等于信号在新速率下的真值 2*pi*f*Ts2(独立公式)
+        self.assertAlmostEqual(pll.omega, 2.0 * math.pi * f_hz * ts2,
+                               delta=1e-15)
+
+    def test_convenience_input_forms(self):
+        params = PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5)
+        p1 = PLL(params).set_sample_period(0.5).params_new
+        p2 = PLL(params).set_sample_period((0.5, "seconds")).params_new
+        p3 = PLL(params).set_sample_period(SamplePeriod.seconds(0.5)).params_new
+        self.assertEqual((p1.kp, p1.ki, p1.wmax),
+                         (p2.kp, p2.ki, p2.wmax))
+        self.assertEqual((p1.kp, p1.ki, p1.wmax),
+                         (p3.kp, p3.ki, p3.wmax))
+
+    def test_unitless_to_seconds_switch(self):
+        # 无量纲单位(视为 1 秒)切到真实秒周期也合法。
+        params = PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5,
+                           ts=SamplePeriod(1.0, "samples"))
+        pll = PLL(params, omega0=0.4)
+        rep = pll.set_sample_period(SamplePeriod.seconds(2e-5))
+        self.assertAlmostEqual(rep.ratio, 2e-5, delta=1e-20)
+        self.assertAlmostEqual(pll.omega, 0.4 * 2e-5, delta=1e-18)
+
+
+class TestRateSwitchContinuity(unittest.TestCase):
+    """无噪声固定频率 + 一次切换:相位连续性、锁定保持与收敛误差。"""
+
+    def _locked_pll(self, ts, f_hz, n, kp=0.2, ki=0.02, eps=0.2):
+        params = PLLParams(kp=kp, ki=ki, wmax=1.0, amin=0.0,
+                           eps=eps, lock_count=20,
+                           ts=SamplePeriod.seconds(ts))
+        pll = PLL(params)
+        seg, w = physical_pilot(1.0, 0.0, f_hz, ts, n)
+        res = pll.run(seg)
+        return pll, params, res, w
+
+    def test_phase_continuous_and_relock(self):
+        fs1, fs2 = 48000.0, 96000.0
+        ts1, ts2 = 1.0 / fs1, 1.0 / fs2
+        r = ts2 / ts1  # 0.5
+        f_hz = 1000.0
+        n1, n2 = 600, 400
+        pll, _, _, w1 = self._locked_pll(ts1, f_hz, n1)
+        self.assertTrue(pll.locked)
+        self.assertAlmostEqual(pll.omega, w1, delta=1e-6)
+
+        theta_before = pll.theta
+        omega_before = pll.omega
+        streak_before = pll.streak
+        rep = pll.set_sample_period(SamplePeriod.seconds(ts2))
+        # 物理相位连续:theta 逐位不变
+        self.assertEqual(pll.theta, theta_before)
+        self.assertEqual(rep.theta_new, rep.theta_old)
+        self.assertAlmostEqual(rep.omega_new, omega_before * r, delta=1e-15)
+        self.assertEqual(pll.streak, streak_before)
+        self.assertTrue(pll.locked)  # 切换本身不消耗样本、不清计数
+
+        # 第二段样本: 时间戳从"上一个样本之后隔一个新周期"继续。
+        # 最后处理的样本在 t=(n1-1)*Ts1, 下一个在 t=(n1-1)*Ts1+Ts2。
+        seg2 = [
+            complex(math.cos(2.0 * math.pi * f_hz * ((n1 - 1) * ts1 + m * ts2)),
+                    math.sin(2.0 * math.pi * f_hz * ((n1 - 1) * ts1 + m * ts2)))
+            for m in range(1, n2 + 1)
+        ]
+        res2 = pll.run(seg2)
+        first = res2.diagnostics[0]
+        # 独立推导的首个新速率样本误差: 锁定时 theta 领先一个旧增量,
+        # 预测相位为 phi0+n1*w1; 实际相位为 phi0+(n1-1)w1+w2;
+        # error = w2 - w1 = (r-1)*w1。
+        w2 = 2.0 * math.pi * f_hz * ts2
+        expected_first_error = wrap_phase(w2 - w1)
+        self.assertAlmostEqual(first.error, expected_first_error, delta=1e-6)
+        # |(r-1)*w1| <= eps 时锁定不中断
+        self.assertLessEqual(abs(expected_first_error), 0.2)
+        self.assertTrue(first.locked)
+        self.assertTrue(res2.locked)
+        # 新速率下重新收敛到信号真值,物理频偏仍是 f_hz
+        self.assertAlmostEqual(res2.omega, w2, delta=1e-7)
+        self.assertLessEqual(abs(res2.diagnostics[-1].error), 1e-6)
+        # Hz 容差由 omega 容差换算: 1e-7/(2*pi*Ts2)
+        self.assertAlmostEqual(pll.frequency_hz, f_hz,
+                               delta=1e-7 / (2.0 * math.pi * ts2) * 5)
+        self.assertEqual(res2.lost_samples, 0)
+
+    def test_switch_then_chunk_equivalence(self):
+        # 同一切换操作序列,整批/逐步必须逐位一致。
+        ts1, ts2 = 1.0 / 48000.0, 1.0 / 24000.0
+        f_hz = 800.0
+        n1, n2 = 300, 200
+
+        def build():
+            seg1, _ = physical_pilot(1.0, 0.3, f_hz, ts1, n1)
+            seg2 = [
+                complex(math.cos(0.3 + 2.0 * math.pi * f_hz *
+                                 ((n1 - 1) * ts1 + m * ts2)),
+                        math.sin(0.3 + 2.0 * math.pi * f_hz *
+                                 ((n1 - 1) * ts1 + m * ts2)))
+                for m in range(1, n2 + 1)
+            ]
+            return seg1, seg2
+
+        def make_pll():
+            return PLL(PLLParams(kp=0.15, ki=0.01, wmax=1.0, amin=0.0,
+                                 eps=0.05, lock_count=20,
+                                 ts=SamplePeriod.seconds(ts1)))
+
+        seg1, seg2 = build()
+        a = make_pll()
+        ra = a.run(seg1)
+        a.set_sample_period(SamplePeriod.seconds(ts2))
+        rb = a.run(seg2)
+
+        b = make_pll()
+        d1 = [b.step(z) for z in seg1]
+        b.set_sample_period(SamplePeriod.seconds(ts2))
+        d2 = [b.step(z) for z in seg2]
+        self.assertEqual(tuple(d1), ra.diagnostics)
+        self.assertEqual(tuple(d2), rb.diagnostics)
+        self.assertEqual(b.omega, a.omega)
+        self.assertEqual(b.theta, a.theta)
+        self.assertEqual(b.params, a.params)
+
+
+class TestRateSwitchBoundary(unittest.TestCase):
+    def test_ratio_one_is_idempotent(self):
+        params = PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5,
+                           ts=SamplePeriod.seconds(0.25))
+        pll = PLL(params, theta0=-1.1, omega0=0.3)
+        pll.run(make_pilot(1.0, 0.0, 0.3, 30))
+        omega0, theta0, p0 = pll.omega, pll.theta, pll.params
+        rep = pll.set_sample_period(SamplePeriod.seconds(0.25))
+        self.assertEqual(rep.ratio, 1.0)
+        self.assertEqual(pll.omega, omega0)
+        self.assertEqual(pll.theta, theta0)
+        self.assertEqual(pll.params, p0)
+        self.assertEqual(pll.params.kp, 0.2)
+
+    def test_switch_at_zero_samples(self):
+        pll = PLL(PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.5,
+                            eps=0.05, lock_count=5))
+        rep = pll.set_sample_period(0.5)
+        self.assertEqual(rep.index, 0)
+        self.assertEqual(pll.processed, 0)
+        self.assertEqual(pll.theta, 0.0)
+
+    def test_saturated_omega_scales_with_rail(self):
+        # 频偏 0.8、wmax=0.5: omega 贴在 0.5 限幅上。
+        params = PLLParams(kp=0.1, ki=0.05, wmax=0.5, amin=0.5,
+                           eps=0.05, lock_count=10)
+        pll = PLL(params)
+        pll.run(make_pilot(1.0, 0.0, 0.8, 400))
+        self.assertEqual(pll.omega, 0.5)
+        # r=0.5: 新限幅 0.25,缩放后 omega 恰好落在新限幅上。
+        rep = pll.set_sample_period(SamplePeriod.seconds(0.5))
+        self.assertEqual(pll.omega, 0.25)
+        self.assertEqual(pll.omega, pll.params.wmax)
+        self.assertEqual(rep.params_new.wmax, 0.25)
+        # r=2 反向(从单位周期): 限幅与 omega 同步翻倍仍贴幅。
+        # 取 ki=0.02 以保证 4ki < kp, 缩放后仍在稳定范围内。
+        params_up = PLLParams(kp=0.1, ki=0.02, wmax=0.5, amin=0.5,
+                              eps=0.05, lock_count=10)
+        pll2 = PLL(params_up)
+        pll2.run(make_pilot(1.0, 0.0, 0.8, 400))
+        rep2 = pll2.set_sample_period(SamplePeriod.seconds(2.0))
+        self.assertEqual(rep2.params_new.kp, 0.2)
+        self.assertEqual(rep2.params_new.ki, 0.08)
+        self.assertEqual(rep2.params_new.wmax, 1.0)
+        self.assertEqual(pll2.omega, 1.0)
+
+
+class TestRateSwitchRejection(unittest.TestCase):
+    def test_bad_period_rejected_atomically(self):
+        params = PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5,
+                           ts=SamplePeriod.seconds(1.0))
+        pll = PLL(params, theta0=0.9, omega0=0.3)
+        pll.run(make_pilot(1.0, 0.0, 0.3, 30))
+        snap = (pll.omega, pll.theta, pll.streak, pll.processed,
+                pll.params.kp, pll.params.ki, pll.params.wmax,
+                pll.sample_period_seconds)
+        bad_inputs = [
+            0.0, -0.5, float("nan"), float("inf"), True, "0.5", None,
+            (0.5,), (0.5, "weeks"), (0.0, "seconds"),
+            (float("inf"), "seconds"), object(),
+        ]
+        for bad in bad_inputs:
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(PLLSwitchError):
+                    pll.set_sample_period(bad)
+        self.assertEqual(
+            (pll.omega, pll.theta, pll.streak, pll.processed,
+             pll.params.kp, pll.params.ki, pll.params.wmax,
+             pll.sample_period_seconds),
+            snap,
+        )
+
+    def test_instability_kp_rejected_atomically(self):
+        # kp*r >= 1: 拒绝, 状态不变。
+        params = PLLParams(kp=0.6, ki=0.05, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5)
+        pll = PLL(params, omega0=0.2)
+        with self.assertRaises(PLLSwitchError) as ctx:
+            pll.set_sample_period(2.0)  # r=2 -> kp'=1.2
+        self.assertIn("kp", str(ctx.exception))
+        self.assertEqual(pll.params.kp, 0.6)
+        self.assertEqual(pll.omega, 0.2)
+        self.assertEqual(pll.sample_period_seconds, 1.0)
+        # 边界: kp*r 恰好 1.0 也拒绝(要求严格 < 1)
+        pll2 = PLL(PLLParams(kp=0.5, ki=0.02, wmax=1.0, amin=0.5,
+                             eps=0.05, lock_count=5))
+        with self.assertRaises(PLLSwitchError):
+            pll2.set_sample_period(2.0)
+
+    def test_instability_ki_rejected_atomically(self):
+        # kp'=0.22 < 1 但 ki'=0.19*1.21=0.2299 >= kp': 命中第二条稳定性检查。
+        params = PLLParams(kp=0.2, ki=0.19, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5)
+        pll = PLL(params)
+        with self.assertRaises(PLLSwitchError) as ctx:
+            pll.set_sample_period(1.1)
+        self.assertIn("ki", str(ctx.exception))
+        self.assertEqual(pll.params.kp, 0.2)
+        self.assertEqual(pll.params.ki, 0.19)
+        self.assertEqual(pll.sample_period_seconds, 1.0)
+
+    def test_switch_error_is_value_error(self):
+        pll = PLL(PLLParams(**GOOD))
+        with self.assertRaises(ValueError):
+            pll.set_sample_period(0.0)
+
+    def test_failed_switch_then_behavior_matches_control(self):
+        # 拒绝切换后继续处理,轨迹应与从未尝试切换的对照实例逐位一致。
+        params = PLLParams(kp=0.6, ki=0.05, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5)
+        a, b = PLL(params), PLL(params)
+        samples = make_pilot(1.0, 0.3, 0.2, 40)
+        with self.assertRaises(PLLSwitchError):
+            a.set_sample_period(2.0)
+        self.assertEqual(a.run(samples).diagnostics,
+                         b.run(samples).diagnostics)
+
+
+class TestPhysicalUnits(unittest.TestCase):
+    def test_frequency_properties_and_legacy_conversion(self):
+        ts = 1.0 / 48000.0
+        w = 0.3
+        params = PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.5,
+                           eps=0.05, lock_count=5,
+                           ts=SamplePeriod.seconds(ts))
+        pll = PLL(params, omega0=w)
+        self.assertAlmostEqual(pll.sample_rate, 48000.0, delta=1e-6)
+        self.assertAlmostEqual(pll.frequency_hz,
+                               w * 48000.0 / (2.0 * math.pi), delta=1e-9)
+        # 旧换算入口保持可用且口径一致
+        res = pll.run([1 + 0j])
+        self.assertAlmostEqual(res.frequency_offset(48000.0),
+                               pll.frequency_hz, delta=1e-9)
+        with self.assertRaises(PLLInputError):
+            res.frequency_offset(0.0)
 
 
 if __name__ == "__main__":
