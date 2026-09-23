@@ -13,6 +13,16 @@
 连续 lock_count 个有效样本满足 |error| <= eps 时进入 locked;
 任一有效样本 |error| > eps 立即清零计数并退出 locked。
 
+单位约定:
+- theta: 物理相位, 单位 rad, 取值 [-pi, pi)。
+- omega: 频率字, 单位 rad/sample, 即物理角频率 Omega(rad/s) 乘以采样周期 Ts。
+- kp/ki: 每样本增益(无量纲)。
+
+运行中切换采样周期: set_sample_period(new_period) 按 r = Ts_new/Ts_old 同步
+缩放频率字与增益(omega*r, kp*r, ki*r^2, wmax*r), 保持物理角频率、连续时间
+环路动态与物理相位连续; theta 与捕获计数不变。缩放后参数越界(如 kp*r >= 1)
+则抛 PLLParamError, PLL 状态保持切换前原样。
+
 仅依赖 Python 标准库(math / dataclasses)。
 """
 
@@ -27,6 +37,7 @@ __all__ = [
     "PLL",
     "Diagnostic",
     "PLLResult",
+    "SamplePeriodChange",
     "PLLError",
     "PLLParamError",
     "PLLInputError",
@@ -171,6 +182,7 @@ class PLLResult:
     lost_samples: 累计失锁(无效)样本数。
     processed:    累计已处理样本数。
     diagnostics:  本批逐样本诊断(仅本批,不含历史批次)。
+    sample_period: 本批处理时的采样周期 Ts(秒), 用于频率单位换算。
     """
 
     params: PLLParams
@@ -181,22 +193,61 @@ class PLLResult:
     lost_samples: int
     processed: int
     diagnostics: Tuple[Diagnostic, ...]
+    sample_period: float = 1.0
 
-    def frequency_offset(self, sample_rate: float = 1.0) -> float:
-        """把估计频偏换算到 Hz: omega * sample_rate / (2*pi)。"""
-        fs = _finite_real("sample_rate", sample_rate, PLLInputError)
-        if fs <= 0.0:
-            raise PLLInputError(f"sample_rate: 需要 > 0, 得到 {fs!r}")
+    def frequency_offset(self, sample_rate: Optional[float] = None) -> float:
+        """把估计频偏换算到 Hz: omega * sample_rate / (2*pi)。
+
+        sample_rate 省略时使用结果快照记录的采样周期(fs = 1/sample_period)。
+        """
+        if sample_rate is None:
+            fs = 1.0 / self.sample_period
+        else:
+            fs = _finite_real("sample_rate", sample_rate, PLLInputError)
+            if fs <= 0.0:
+                raise PLLInputError(f"sample_rate: 需要 > 0, 得到 {fs!r}")
         return self.omega * fs / _TWO_PI
+
+
+@dataclass(frozen=True)
+class SamplePeriodChange:
+    """set_sample_period() 的切换报告。
+
+    old_period:   切换前采样周期 Ts(秒)。
+    new_period:   切换后采样周期 Ts(秒)。
+    ratio:        缩放比 r = new_period / old_period。
+    omega_before: 切换前频率字(rad/sample, 旧周期)。
+    omega_after:  切换后频率字(rad/sample, 新周期); 物理角频率 omega/Ts 不变。
+    theta:        相位状态(rad), 切换前后不变(物理相位连续)。
+    old_params:   切换前环路参数。
+    new_params:   切换后环路参数(kp*r, ki*r^2, wmax*r, 其余不变)。
+    """
+
+    old_period: float
+    new_period: float
+    ratio: float
+    omega_before: float
+    omega_after: float
+    theta: float
+    old_params: PLLParams
+    new_params: PLLParams
+
+    @property
+    def angular_frequency(self) -> float:
+        """切换前后保持不变的物理角频率 Omega = omega/Ts(rad/s)。"""
+        return self.omega_after / self.new_period
 
 
 class PLL:
     """二阶离散 PLL 捕获器(有状态)。
 
     同一实例可任意分块连续调用 run()/step(),结果与一次性处理完全一致。
+    sample_period 记录当前采样周期(秒), 决定 omega 的 rad/sample 基准与
+    频率换算; 可用 set_sample_period() 在运行中切换。
     """
 
-    def __init__(self, params: PLLParams, theta0: float = 0.0, omega0: float = 0.0):
+    def __init__(self, params: PLLParams, theta0: float = 0.0, omega0: float = 0.0,
+                 sample_period: float = 1.0):
         if not isinstance(params, PLLParams):
             raise PLLParamError(
                 f"params: 需要 PLLParams, 得到 {type(params).__name__}"
@@ -208,9 +259,13 @@ class PLL:
                 f"omega0: |omega0|={abs(omega0)!r} 超出 wmax={params.wmax!r}, "
                 "拒绝静默限幅,请显式调整"
             )
+        sample_period = _finite_real("sample_period", sample_period, PLLParamError)
+        if not sample_period > 0.0:
+            raise PLLParamError(f"sample_period: 需要 > 0, 得到 {sample_period!r}")
         self._params = params
         self._theta = wrap_phase(theta0)
         self._omega = omega0
+        self._sample_period = sample_period
         self._streak = 0
         self._lost = 0
         self._processed = 0
@@ -237,12 +292,55 @@ class PLL:
         return self._streak
 
     @property
+    def sample_period(self) -> float:
+        """当前采样周期 Ts(秒); omega 的单位 rad/sample 以此为基准。"""
+        return self._sample_period
+
+    @property
+    def sample_rate(self) -> float:
+        """当前采样率 fs = 1/sample_period(Hz)。"""
+        return 1.0 / self._sample_period
+
+    @property
     def lost_samples(self) -> int:
         return self._lost
 
     @property
     def processed(self) -> int:
         return self._processed
+
+    # ---- 采样周期切换 ----
+    def set_sample_period(self, new_period) -> SamplePeriodChange:
+        """运行中切换采样周期, 保持物理相位连续与环路动态不变。
+
+        按 r = Ts_new/Ts_old 同步缩放:
+          omega <- omega * r   (物理角频率 omega/Ts 不变)
+          kp    <- kp * r      (连续时间比例增益 kp/Ts 不变)
+          ki    <- ki * r^2    (连续时间积分增益 ki/Ts^2 不变)
+          wmax  <- wmax * r    (限幅对应的物理频率范围不变)
+        theta(rad)、eps(rad)、amin、lock_count、捕获计数与失锁计数不变。
+
+        缩放后参数越界(如 kp*r >= 1 或 ki*r^2 >= kp*r)时抛 PLLParamError,
+        PLL 状态保持调用前原样(先校验后提交, 不留半更新状态)。
+        成功时返回 SamplePeriodChange 报告。
+        """
+        sp = _finite_real("new_period", new_period, PLLParamError)
+        if not sp > 0.0:
+            raise PLLParamError(f"new_period: 需要 > 0, 得到 {sp!r}")
+        old_period = self._sample_period
+        r = sp / old_period
+        p = self._params
+        # 先构造新参数完成全部稳定性校验, 通过后才提交, 保证原子性。
+        new_params = PLLParams(kp=p.kp * r, ki=p.ki * r * r, wmax=p.wmax * r,
+                               amin=p.amin, eps=p.eps, lock_count=p.lock_count)
+        omega_new = self._omega * r
+        change = SamplePeriodChange(
+            old_period, sp, r, self._omega, omega_new, self._theta, p, new_params
+        )
+        self._params = new_params
+        self._omega = omega_new
+        self._sample_period = sp
+        return change
 
     # ---- 核心更新 ----
     def _step_validated(self, re: float, im: float) -> Diagnostic:
@@ -313,4 +411,5 @@ class PLL:
         return PLLResult(
             self._params, self._omega, self._theta, self.locked,
             self._streak, self._lost, self._processed, tuple(diags),
+            self._sample_period,
         )

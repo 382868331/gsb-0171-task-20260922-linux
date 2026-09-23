@@ -291,5 +291,179 @@ class TestSampleValidation(unittest.TestCase):
         self.assertAlmostEqual(d.amplitude, 1.0, delta=1e-15)
 
 
+class TestSamplePeriodSwitch(unittest.TestCase):
+    """运行中切换采样周期: 缩放律、相位连续、收敛与失败原子性。
+
+    期望值来源: 缩放关系(omega*r, kp*r, ki*r^2, wmax*r)是题面解析关系,
+    相位连续性由信号模型 z = exp(j*(phi0 + Omega*t)) 直接推出, 不经过被测实现。
+    """
+
+    PARAMS = dict(kp=0.12, ki=0.008, wmax=1.2, amin=0.2, eps=0.03, lock_count=40)
+
+    def test_scaling_law_analytic(self):
+        # 手算: z = exp(j*0.6), theta0 = omega0 = 0
+        # error = 0.6; omega = ki*0.6 = theta = ki*0.6 + kp*0.6
+        kp, ki = 0.2, 0.02
+        pll = PLL(PLLParams(kp=kp, ki=ki, wmax=1.0, amin=0.5,
+                            eps=0.05, lock_count=3), sample_period=1e-3)
+        pll.step(complex(math.cos(0.6), math.sin(0.6)))
+        omega_pre = ki * 0.6
+        theta_pre = ki * 0.6 + kp * 0.6
+        self.assertAlmostEqual(pll.omega, omega_pre, delta=1e-15)
+        change = pll.set_sample_period(2e-3)   # r = 2
+        # 解析缩放律: omega*2, kp*2, ki*4, wmax*2; theta 不变
+        self.assertAlmostEqual(pll.omega, omega_pre * 2.0, delta=1e-15)
+        self.assertAlmostEqual(pll.theta, theta_pre, delta=1e-15)
+        self.assertAlmostEqual(pll.params.kp, kp * 2.0, delta=1e-15)
+        self.assertAlmostEqual(pll.params.ki, ki * 4.0, delta=1e-15)
+        self.assertAlmostEqual(pll.params.wmax, 2.0, delta=1e-15)
+        # 未缩放的字段保持不变
+        self.assertEqual(pll.params.amin, 0.5)
+        self.assertEqual(pll.params.eps, 0.05)
+        self.assertEqual(pll.params.lock_count, 3)
+        self.assertEqual(pll.sample_period, 2e-3)
+        # 物理角频率 Omega = omega/Ts 不变: 12 rad/s
+        self.assertAlmostEqual(pll.omega / pll.sample_period,
+                               omega_pre / 1e-3, delta=1e-9)
+        self.assertAlmostEqual(change.angular_frequency, 12.0, delta=1e-9)
+
+    def test_phase_continuity_and_convergence_after_switch(self):
+        # 无噪声固定频率导频: z(t) = exp(j*(phi0 + Omega*t)), f = 1500 Hz
+        fs1 = 48000.0
+        ts1 = 1.0 / fs1
+        freq_hz = 1500.0
+        omega_phys = 2.0 * math.pi * freq_hz
+        phi0 = 0.7
+        n1, n2 = 800, 400
+        pll = PLL(PLLParams(**self.PARAMS), sample_period=ts1)
+        s1 = [complex(math.cos(phi0 + omega_phys * k * ts1),
+                      math.sin(phi0 + omega_phys * k * ts1)) for k in range(n1)]
+        r1 = pll.run(s1)
+        self.assertTrue(r1.locked)
+        self.assertLessEqual(abs(r1.omega - omega_phys * ts1), 1e-9)
+
+        theta_before = pll.theta
+        ts2 = 2.0 * ts1   # 48 kHz -> 24 kHz, r = 2
+        pll.set_sample_period(ts2)
+        # 切换本身不改变相位状态(逐位不变)
+        self.assertEqual(pll.theta, theta_before)
+
+        # 信号在新采样时刻 t = n1*ts1 + m*ts2 上连续采样
+        s2 = [complex(math.cos(phi0 + omega_phys * (n1 * ts1 + m * ts2)),
+                      math.sin(phi0 + omega_phys * (n1 * ts1 + m * ts2)))
+              for m in range(n2)]
+        r2 = pll.run(s2)
+        errors = [abs(d.error) for d in r2.diagnostics]
+        # 相位连续: 切换后无重新捕获瞬态, 误差始终在稳态残差量级(<< eps)
+        self.assertLess(max(errors), 1e-4)
+        self.assertTrue(all(d.locked for d in r2.diagnostics))
+        # 收敛: omega 收敛到新周期下的真值 Omega*ts2
+        self.assertLessEqual(abs(r2.omega - omega_phys * ts2), 1e-9)
+        self.assertTrue(r2.locked)
+        # 换算 Hz 与真值一致
+        self.assertAlmostEqual(r2.frequency_offset(), freq_hz, delta=1e-6)
+
+    def test_switch_same_period_is_noop(self):
+        pll = PLL(PLLParams(**self.PARAMS), sample_period=1e-3)
+        pll.run(make_pilot(1.0, 0.4, 0.2, 100))
+        omega, theta = pll.omega, pll.theta
+        change = pll.set_sample_period(1e-3)
+        self.assertEqual(change.ratio, 1.0)
+        self.assertEqual(pll.omega, omega)
+        self.assertEqual(pll.theta, theta)
+        self.assertEqual(pll.params, pll.params.__class__(**self.PARAMS))
+
+    def test_downscale_boundary(self):
+        # 边界: r 很小(周期缩小 1000 倍), 增益与频率字同步缩小但仍合法。
+        pll = PLL(PLLParams(**self.PARAMS), sample_period=1e-3)
+        pll.run(make_pilot(1.0, 0.4, 0.2, 400))
+        self.assertTrue(pll.locked)
+        omega = pll.omega
+        pll.set_sample_period(1e-6)
+        self.assertAlmostEqual(pll.omega, omega * 1e-3, delta=1e-18)
+        self.assertAlmostEqual(pll.params.kp, 0.12 * 1e-3, delta=1e-18)
+        self.assertAlmostEqual(pll.params.ki, 0.008 * 1e-6, delta=1e-24)
+        self.assertTrue(pll.locked)  # 捕获计数不受切换影响
+
+    def test_invalid_new_period_rejected_state_unchanged(self):
+        pll = PLL(PLLParams(**self.PARAMS), sample_period=1e-3)
+        pll.run(make_pilot(1.0, 0.4, 0.2, 100))
+        params, omega, theta = pll.params, pll.omega, pll.theta
+        for bad in (0.0, -1e-3, float("nan"), float("inf"), True, "2e-3", None):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(PLLParamError):
+                    pll.set_sample_period(bad)
+        self.assertIs(pll.params, params)
+        self.assertEqual(pll.omega, omega)
+        self.assertEqual(pll.theta, theta)
+        self.assertEqual(pll.sample_period, 1e-3)
+
+    def test_unstable_scaling_rejected_state_unchanged(self):
+        # kp*r >= 1: r = 10 -> kp = 1.2, 拒绝且不留半更新状态
+        pll = PLL(PLLParams(kp=0.2, ki=0.02, wmax=1.0, amin=0.5,
+                            eps=0.05, lock_count=5), sample_period=1e-3)
+        pll.run(make_pilot(1.0, 0.4, 0.2, 50))
+        params, omega, theta = pll.params, pll.omega, pll.theta
+        with self.assertRaises(PLLParamError):
+            pll.set_sample_period(1e-2)
+        self.assertIs(pll.params, params)
+        self.assertEqual(pll.omega, omega)
+        self.assertEqual(pll.theta, theta)
+        self.assertEqual(pll.sample_period, 1e-3)
+        # ki*r^2 >= kp*r 分支: kp=0.5, ki=0.3, r=1.8 -> kp*r=0.9 < 1 但
+        # ki*r^2 = 0.972 >= 0.9, 同样拒绝
+        pll2 = PLL(PLLParams(kp=0.5, ki=0.3, wmax=1.0, amin=0.5,
+                             eps=0.05, lock_count=5), sample_period=1e-3)
+        with self.assertRaises(PLLParamError):
+            pll2.set_sample_period(1.8e-3)
+        self.assertEqual(pll2.params.kp, 0.5)
+        self.assertEqual(pll2.sample_period, 1e-3)
+
+    def test_bad_constructor_sample_period(self):
+        for bad in (0.0, -1.0, float("nan"), float("inf"), True, "1e-3"):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(PLLParamError):
+                    PLL(PLLParams(**self.PARAMS), sample_period=bad)
+
+    def test_result_tracks_period_and_frequency_offset(self):
+        # 切换后 run() 结果快照携带新周期; frequency_offset() 省略参数时用
+        # 跟踪的周期换算, 显式给 sample_rate 的旧用法不变。
+        ts1, ts2 = 1.0 / 48000.0, 1.0 / 24000.0
+        pll = PLL(PLLParams(**self.PARAMS), sample_period=ts1)
+        pll.run(make_pilot(1.0, 0.4, 0.2, 10))
+        pll.set_sample_period(ts2)
+        result = pll.run(make_pilot(1.0, 0.4, 0.4, 10))
+        self.assertEqual(result.sample_period, ts2)
+        self.assertAlmostEqual(result.frequency_offset(),
+                               result.omega * 24000.0 / (2.0 * math.pi),
+                               delta=1e-15)
+        self.assertAlmostEqual(result.frequency_offset(48000.0),
+                               result.omega * 48000.0 / (2.0 * math.pi),
+                               delta=1e-15)
+        # 旧默认行为: 未指定周期时默认 1.0, frequency_offset() == omega/(2*pi)
+        legacy = PLL(PLLParams(**self.PARAMS)).run(make_pilot(1.0, 0.4, 0.2, 5))
+        self.assertEqual(legacy.sample_period, 1.0)
+        self.assertAlmostEqual(legacy.frequency_offset(),
+                               legacy.omega / (2.0 * math.pi), delta=1e-15)
+
+    def test_report_fields(self):
+        pll = PLL(PLLParams(**self.PARAMS), sample_period=1e-3)
+        pll.run(make_pilot(1.0, 0.4, 0.2, 100))
+        omega, theta = pll.omega, pll.theta
+        change = pll.set_sample_period(4e-3)   # r = 4
+        self.assertEqual(change.old_period, 1e-3)
+        self.assertEqual(change.new_period, 4e-3)
+        self.assertEqual(change.ratio, 4.0)
+        self.assertEqual(change.omega_before, omega)
+        self.assertEqual(change.omega_after, omega * 4.0)
+        self.assertEqual(change.theta, theta)
+        self.assertEqual(change.old_params.kp, 0.12)
+        self.assertEqual(change.new_params.kp, 0.48)
+        # 切换前后物理角频率一致
+        self.assertAlmostEqual(change.omega_before / change.old_period,
+                               change.omega_after / change.new_period,
+                               delta=1e-9)
+
+
 if __name__ == "__main__":
     unittest.main()
