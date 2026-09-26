@@ -1,4 +1,4 @@
-"""整数采样数字锁相环(PLL)捕获诊断模块。
+"""整数采样数字锁相环(PLL)捕获诊断模块(含 holdover/reacquire 状态机)。
 
 基于合成复数导频的二阶离散 PLL。每个有效样本按如下顺序更新:
 
@@ -12,6 +12,20 @@
 
 连续 lock_count 个有效样本满足 |error| <= eps 时进入 locked;
 任一有效样本 |error| > eps 立即清零计数并退出 locked。
+
+可选的导频短暂消失处理(默认关闭, 行为与旧版完全一致):
+
+- tracking:  正常跟踪(默认状态)。
+- holdover:  幅度连续低于 amin 达到 holdover_samples 个样本后进入;
+             冻结最近 median_window 个有效频率估计的中位数 omega_hold,
+             每样本仅以 theta += omega_hold 推进相位, 不再用噪声更新积分项。
+- reacquire: 参考重新有效后进入; 不瞬间重置相位, 每样本相位校正被限幅在
+             ±max_phase_step 内逐渐追上; 连续 reacquire_count 个样本同时满足
+             |error| <= eps 且 |omega' - omega| <= freq_eps 才重新标记锁定
+             并回到 tracking。
+
+门限相等时的归属(明确约定): 幅度 == amin 判为有效样本; |error| == eps 计入
+捕获/重捕获计数; |omega' - omega| == freq_eps 计入重捕获计数(均为 <= 语义)。
 
 仅依赖 Python 标准库(math / dataclasses)。
 """
@@ -33,6 +47,11 @@ __all__ = [
     "MAX_SAMPLES",
     "wrap_phase",
 ]
+
+#: 环路状态字面量
+STATE_TRACKING = "tracking"
+STATE_HOLDOVER = "holdover"
+STATE_REACQUIRE = "reacquire"
 
 #: run() 单次调用允许的最大样本数(诊断逐样本保存,限制内存占用)。
 MAX_SAMPLES = 1_000_000
@@ -94,6 +113,12 @@ class PLLParams:
     amin:       有效样本最小幅度,有限且 >= 0。
     eps:        捕获误差门限(rad),有限且 > 0。
     lock_count: 进入 locked 所需的连续有效样本数 L,int 且 >= 1(拒绝 bool)。
+    holdover_samples: 连续低幅样本达到该数后进入 holdover;0 表示禁用(默认,
+                保持旧版"冻结并清零计数"行为)。int 且 >= 0(拒绝 bool)。
+    median_window:  holdover 冻结频率取最近 W 个有效样本 omega 的中位数,W >= 1。
+    max_phase_step: reacquire 期间每样本相位校正幅度上限(rad),有限且 > 0。
+    freq_eps:   reacquire 重锁定的频率误差条件 |omega' - omega| <= freq_eps,> 0。
+    reacquire_count: 重锁定所需的连续满足双条件的样本数,int 且 >= 1。
     """
 
     kp: float
@@ -102,6 +127,11 @@ class PLLParams:
     amin: float
     eps: float
     lock_count: int
+    holdover_samples: int = 0
+    median_window: int = 5
+    max_phase_step: float = 0.05
+    freq_eps: float = 0.01
+    reacquire_count: int = 10
 
     def __post_init__(self) -> None:
         kp = _finite_real("kp", self.kp, PLLParamError)
@@ -126,12 +156,35 @@ class PLLParams:
             )
         if lc < 1:
             raise PLLParamError(f"lock_count: 需要 >= 1, 得到 {lc!r}")
+        for name in ("holdover_samples", "median_window", "reacquire_count"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise PLLParamError(
+                    f"{name}: 需要 int(拒绝 bool), 得到 {type(v).__name__}({v!r})"
+                )
+        if self.holdover_samples < 0:
+            raise PLLParamError(
+                f"holdover_samples: 需要 >= 0, 得到 {self.holdover_samples!r}")
+        if self.median_window < 1:
+            raise PLLParamError(
+                f"median_window: 需要 >= 1, 得到 {self.median_window!r}")
+        if self.reacquire_count < 1:
+            raise PLLParamError(
+                f"reacquire_count: 需要 >= 1, 得到 {self.reacquire_count!r}")
+        mps = _finite_real("max_phase_step", self.max_phase_step, PLLParamError)
+        feps = _finite_real("freq_eps", self.freq_eps, PLLParamError)
+        if not mps > 0.0:
+            raise PLLParamError(f"max_phase_step: 需要 > 0, 得到 {mps!r}")
+        if not feps > 0.0:
+            raise PLLParamError(f"freq_eps: 需要 > 0, 得到 {feps!r}")
         # 统一规范为 float,避免 int/float 混用造成的表示差异。
         object.__setattr__(self, "kp", kp)
         object.__setattr__(self, "ki", ki)
         object.__setattr__(self, "wmax", wmax)
         object.__setattr__(self, "amin", amin)
         object.__setattr__(self, "eps", eps)
+        object.__setattr__(self, "max_phase_step", mps)
+        object.__setattr__(self, "freq_eps", feps)
 
 
 @dataclass(frozen=True)
@@ -147,6 +200,7 @@ class Diagnostic:
     streak:    本步之后连续满足 |error| <= eps 的有效样本计数。
     locked:    本步之后是否处于 locked(streak >= lock_count)。
     saturated: 本步 omega 更新是否触发 ±wmax 限幅。
+    state:     本步之后的状态: "tracking" / "holdover" / "reacquire"。
     """
 
     index: int
@@ -158,6 +212,7 @@ class Diagnostic:
     streak: int
     locked: bool
     saturated: bool
+    state: str = STATE_TRACKING
 
 
 @dataclass(frozen=True)
@@ -171,6 +226,7 @@ class PLLResult:
     lost_samples: 累计失锁(无效)样本数。
     processed:    累计已处理样本数。
     diagnostics:  本批逐样本诊断(仅本批,不含历史批次)。
+    state:        本批结束时的环路状态。
     """
 
     params: PLLParams
@@ -181,6 +237,7 @@ class PLLResult:
     lost_samples: int
     processed: int
     diagnostics: Tuple[Diagnostic, ...]
+    state: str = STATE_TRACKING
 
     def frequency_offset(self, sample_rate: float = 1.0) -> float:
         """把估计频偏换算到 Hz: omega * sample_rate / (2*pi)。"""
@@ -214,6 +271,12 @@ class PLL:
         self._streak = 0
         self._lost = 0
         self._processed = 0
+        # holdover/reacquire 状态机(默认参数下恒为 tracking,行为与旧版一致)
+        self._state = STATE_TRACKING
+        self._low_streak = 0            # 连续低幅样本计数(跨 chunk 延续)
+        self._reacquire_streak = 0      # 连续满足重锁定双条件的计数(跨 chunk 延续)
+        self._omega_window = []         # 最近 median_window 个有效样本的 omega
+        self._omega_hold = 0.0          # holdover 期间冻结的频率字
 
     # ---- 只读状态 ----
     @property
@@ -244,18 +307,59 @@ class PLL:
     def processed(self) -> int:
         return self._processed
 
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def omega_hold(self) -> float:
+        """holdover 期间冻结的频率字(非 holdover 状态时为最近一次的冻结值)。"""
+        return self._omega_hold
+
+    def _enter_holdover(self) -> None:
+        window = sorted(self._omega_window)
+        n = len(window)
+        if n == 0:
+            median = self._omega
+        elif n % 2 == 1:
+            median = window[n // 2]
+        else:
+            median = (window[n // 2 - 1] + window[n // 2]) / 2.0
+        self._omega_hold = median
+        self._omega = median
+        self._state = STATE_HOLDOVER
+
     # ---- 核心更新 ----
     def _step_validated(self, re: float, im: float) -> Diagnostic:
         p = self._params
         amp = math.hypot(re, im)
         idx = self._processed
         if amp < p.amin:
-            # 无效样本:冻结 omega/theta,清零捕获计数,计失锁。
+            # 无效样本:清零捕获计数,计失锁。
             self._lost += 1
             self._streak = 0
+            self._reacquire_streak = 0
             self._processed += 1
+            if p.holdover_samples > 0:
+                self._low_streak += 1
+                if self._state is not STATE_HOLDOVER \
+                        and self._low_streak >= p.holdover_samples:
+                    self._enter_holdover()
+                if self._state is STATE_HOLDOVER:
+                    # holdover: 冻结的中位频率继续推进相位, 不用噪声更新积分项。
+                    self._theta = wrap_phase(self._theta + self._omega_hold)
+                    return Diagnostic(idx, False, amp, None, self._omega,
+                                      self._theta, 0, False, False,
+                                      STATE_HOLDOVER)
+            # 旧版行为(holdover 未启用或未达门限): 冻结 omega/theta。
             return Diagnostic(idx, False, amp, None, self._omega, self._theta,
-                              0, False, False)
+                              0, False, False, self._state)
+        # 有效样本
+        self._low_streak = 0
+        if self._state is STATE_HOLDOVER:
+            # 参考重新有效: 进入 reacquire, 不瞬间重置相位。
+            self._state = STATE_REACQUIRE
+            self._reacquire_streak = 0
         # 1. 旋转: y = z * exp(-j*theta)
         c = math.cos(self._theta)
         s = math.sin(self._theta)
@@ -272,18 +376,39 @@ class PLL:
         elif omega_new < -p.wmax:
             omega_new = -p.wmax
             saturated = True
-        # 4. 相位更新(使用限幅后的 omega')
-        theta_new = wrap_phase(self._theta + omega_new + p.kp * error)
-        # 捕获计数:超限立即清零
-        if abs(error) <= p.eps:
-            self._streak += 1
+        # 4. 相位更新(使用限幅后的 omega'); reacquire 期间校正有界
+        if self._state is STATE_REACQUIRE:
+            correction = p.kp * error
+            if correction > p.max_phase_step:
+                correction = p.max_phase_step
+            elif correction < -p.max_phase_step:
+                correction = -p.max_phase_step
+            theta_new = wrap_phase(self._theta + omega_new + correction)
+            # 重锁定双条件: 相位误差与频率误差同时连续达标(== 计入, <= 语义)
+            if abs(error) <= p.eps \
+                    and abs(omega_new - self._omega) <= p.freq_eps:
+                self._reacquire_streak += 1
+            else:
+                self._reacquire_streak = 0
+            if self._reacquire_streak >= p.reacquire_count:
+                self._state = STATE_TRACKING
+                self._streak = p.lock_count  # 重新标记锁定
         else:
-            self._streak = 0
+            theta_new = wrap_phase(self._theta + omega_new + p.kp * error)
+            # 捕获计数:超限立即清零
+            if abs(error) <= p.eps:
+                self._streak += 1
+            else:
+                self._streak = 0
+        # 记录最近 W 个有效样本的频率字(供 holdover 取中位数)
+        self._omega_window.append(omega_new)
+        if len(self._omega_window) > p.median_window:
+            del self._omega_window[:len(self._omega_window) - p.median_window]
         self._omega = omega_new
         self._theta = theta_new
         self._processed += 1
         return Diagnostic(idx, True, amp, error, omega_new, theta_new,
-                          self._streak, self.locked, saturated)
+                          self._streak, self.locked, saturated, self._state)
 
     def step(self, z) -> Diagnostic:
         """处理单个样本并返回其诊断。非法样本抛 PLLInputError,状态不变。"""
@@ -313,4 +438,5 @@ class PLL:
         return PLLResult(
             self._params, self._omega, self._theta, self.locked,
             self._streak, self._lost, self._processed, tuple(diags),
+            self._state,
         )
