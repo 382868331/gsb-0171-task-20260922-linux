@@ -27,12 +27,25 @@ __all__ = [
     "PLL",
     "Diagnostic",
     "PLLResult",
+    "DualReferencePLL",
+    "DualRefDiagnostic",
+    "DualRefResult",
+    "MODE_TRACKING",
+    "MODE_ACQUIRING",
+    "MODE_HOLDOVER",
     "PLLError",
     "PLLParamError",
     "PLLInputError",
     "MAX_SAMPLES",
     "wrap_phase",
 ]
+
+#: 双参考状态:正在跟踪当前参考(输出可信)。
+MODE_TRACKING = "tracking"
+#: 双参考状态:当前参考尚未确认锁定(输出不可信)。
+MODE_ACQUIRING = "acquiring"
+#: 双参考状态:切换/失效期间无任何已确认稳定的参考,输出冻结(不可信)。
+MODE_HOLDOVER = "holdover"
 
 #: run() 单次调用允许的最大样本数(诊断逐样本保存,限制内存占用)。
 MAX_SAMPLES = 1_000_000
@@ -313,4 +326,343 @@ class PLL:
         return PLLResult(
             self._params, self._omega, self._theta, self.locked,
             self._streak, self._lost, self._processed, tuple(diags),
+        )
+
+
+@dataclass(frozen=True)
+class DualRefDiagnostic:
+    """双参考交接器的逐样本诊断。
+
+    index:       样本序号(交接器生命周期内从 0 递增)。
+    active:      本步之后输出所依据的参考:0 或 1。
+    mode:        本步之后的状态: tracking / acquiring / holdover。
+    trusted:     输出相位/频偏是否可信(tracking 时为 True)。
+    handoff:     本步是否刚完成一次无扰动交接。
+    requested:   本步之后待切换目标:None、0 或 1。
+    selected:    当前已交接的参考:None(初始未锁定)、0 或 1。
+    theta:       本步之后的输出相位(rad, [-pi, pi))。
+    omega:       本步之后的输出频偏(rad/sample)。
+    lock0/lock1: 两路参考各自的独立锁定状态。
+    valid0/valid1: 两路参考本样本是否有效(幅度 >= amin)。
+    offset:      本步活动参考的输出对齐偏置(rad, [-pi, pi))。
+    holdover_samples: 本步是否计入保持态失效样本。
+    """
+
+    index: int
+    active: Optional[int]
+    mode: str
+    trusted: bool
+    handoff: bool
+    requested: Optional[int]
+    selected: Optional[int]
+    theta: float
+    omega: float
+    lock0: bool
+    lock1: bool
+    valid0: bool
+    valid1: bool
+    offset: float
+    holdover_samples: int
+
+
+@dataclass(frozen=True)
+class DualRefResult:
+    """双参考交接器一次 run() 的结果快照。
+
+    theta/omega:     当前输出相位/频偏(holdover 时冻结,trusted=False)。
+    selected:        当前已交接参考;None 表示尚未有任何参考确认锁定。
+    requested:       待切换目标;None 表示没有挂起的切换请求。
+    mode:            tracking / acquiring / holdover。
+    trusted:         输出是否可信。
+    holdover_samples:累计处于 holdover 的样本数。
+    handoff_count:   累计完成的交接次数。
+    processed:       累计已处理样本对数量。
+    diagnostics:     本批逐样本诊断(仅本批)。
+    """
+
+    theta: float
+    omega: float
+    selected: Optional[int]
+    requested: Optional[int]
+    mode: str
+    trusted: bool
+    holdover_samples: int
+    handoff_count: int
+    processed: int
+    diagnostics: Tuple[DualRefDiagnostic, ...]
+
+
+class DualReferencePLL:
+    """同采样速率两路参考之间的无扰动切换交接器。
+
+    两路参考各自挂一个独立的 :class:`PLL`,每个样本对两路同时、独立更新。
+    输出相位不是某一路的裸相位,而是 ``wrap(theta_i + offset_i)``:
+
+    - 目标参考先独立跟踪,连续 L 个样本误差在门限内(其 PLL 进入 locked)
+      才确认稳定;未稳定前继续输出原参考。
+    - 交接时仅依据交接瞬间两路裸相位重新计算**一次性**对齐偏置:
+      ``offset_new = wrap(theta_old_out - theta_new_raw)``,使交接样本的
+      输出相位保持原值,不发生跳变;偏置每次交接都重新从零推导,
+      故来回切换不会反复累积人为相位偏移。
+    - 切换期间当前参考失效(幅度 < amin)且目标尚未稳定时进入 holdover:
+      冻结输出并明确 ``mode='holdover'``、``trusted=False``,不假装仍锁定。
+    """
+
+    def __init__(self, params: PLLParams, theta0: float = 0.0,
+                 omega0: float = 0.0):
+        # PLL 构造器负责全部参数/初值校验;两路使用同一组环路参数。
+        self._trackers = (PLL(params, theta0, omega0),
+                          PLL(params, theta0, omega0))
+        self._selected = None       # 已交接参考: None/0/1
+        self._requested = None      # 待切换目标: None/0/1
+        self._offsets = [0.0, 0.0]  # 每路各自的输出对齐偏置
+        self._theta = wrap_phase(theta0)
+        self._omega = omega0
+        self._holdover = 0
+        self._handoffs = 0
+        self._processed = 0
+        self._ever_locked = False   # 是否曾有参考确认锁定(区分 acquiring/holdover)
+
+    # ---- 只读状态 ----
+    @property
+    def params(self) -> PLLParams:
+        return self._trackers[0].params
+
+    @property
+    def trackers(self) -> Tuple[PLL, PLL]:
+        return self._trackers
+
+    @property
+    def selected(self) -> Optional[int]:
+        return self._selected
+
+    @property
+    def requested(self) -> Optional[int]:
+        return self._requested
+
+    @property
+    def theta(self) -> float:
+        return self._theta
+
+    @property
+    def omega(self) -> float:
+        return self._omega
+
+    @property
+    def trusted(self) -> bool:
+        return self._selected is not None
+
+    @property
+    def mode(self) -> str:
+        if self._selected is None:
+            return MODE_HOLDOVER if self._ever_locked else MODE_ACQUIRING
+        return MODE_TRACKING
+
+    @property
+    def holdover_samples(self) -> int:
+        return self._holdover
+
+    @property
+    def handoff_count(self) -> int:
+        return self._handoffs
+
+    @property
+    def processed(self) -> int:
+        return self._processed
+
+    def offset(self, ref: int) -> float:
+        """返回指定参考(0/1)当前的输出对齐偏置。"""
+        if not isinstance(ref, int) or isinstance(ref, bool) or ref not in (0, 1):
+            raise PLLParamError(f"ref: 需要 0 或 1, 得到 {ref!r}")
+        return self._offsets[ref]
+
+    def request_switch(self, ref: int) -> None:
+        """请求切换到参考 ref(0/1)。
+
+        目标参考独立跟踪并确认稳定(PLL locked)后,在下一个有效样本完成
+        无扰动交接;未稳定前继续输出当前参考。非法 ref 抛 PLLParamError。
+        """
+        if not isinstance(ref, int) or isinstance(ref, bool) or ref not in (0, 1):
+            raise PLLParamError(f"ref: 需要 0 或 1, 得到 {ref!r}")
+        self._requested = ref
+
+    def cancel_switch(self) -> None:
+        """撤销尚未完成的切换请求。"""
+        self._requested = None
+
+    def _snapshot(self):
+        """保存全部状态,供整批校验失败时回滚(批次原子性)。"""
+        t0, t1 = self._trackers
+        return (
+            (t0._theta, t0._omega, t0._streak, t0._lost, t0._processed),
+            (t1._theta, t1._omega, t1._streak, t1._lost, t1._processed),
+            self._selected, self._requested,
+            (self._offsets[0], self._offsets[1]),
+            self._theta, self._omega, self._holdover,
+            self._handoffs, self._processed, self._ever_locked,
+        )
+
+    def _restore(self, snap) -> None:
+        (s0, s1, selected, requested, offsets, theta, omega, holdover,
+         handoffs, processed, ever_locked) = snap
+        for tracker, state in zip(self._trackers, (s0, s1)):
+            tracker._theta, tracker._omega, tracker._streak, tracker._lost, tracker._processed = state
+        self._selected = selected
+        self._requested = requested
+        self._offsets[0], self._offsets[1] = offsets
+        self._theta = theta
+        self._omega = omega
+        self._holdover = holdover
+        self._handoffs = handoffs
+        self._processed = processed
+        self._ever_locked = ever_locked
+
+    def _take_handoff(self, target: int) -> None:
+        """在更新后的两路状态上完成一次无扰动交接。
+
+        输出相位保持上一样本值(theta_old),仅按目标参考的新裸相位
+        重新计算一次性偏置;不修改、不继承旧偏置,因此反复切换不累积。
+        """
+        theta_old = self._theta
+        theta_new_raw = self._trackers[target].theta
+        if self._holdover == 0 and self._selected is None and self._handoffs == 0:
+            # 系统首次接管:输出直接对齐该参考裸相位,不引入人为偏置。
+            offset = 0.0
+            theta_out = theta_new_raw
+        else:
+            # 后续交接:仅按两路绝对相位一次性重算偏置,不继承旧偏置。
+            offset = wrap_phase(theta_old - theta_new_raw)
+            theta_out = theta_old
+        self._offsets[target] = offset
+        self._selected = target
+        self._requested = None
+        self._theta = theta_out
+        self._omega = self._trackers[target].omega
+        self._handoffs += 1
+        self._ever_locked = True
+
+    def step(self, pair) -> DualRefDiagnostic:
+        """处理一个样本对 ``(z0, z1)`` 并返回诊断。
+
+        两路参考同采样速率,每步成对喂入。非法样本抛 PLLInputError,
+        交接器与两路 PLL 状态均保持调用前原样。
+        """
+        if isinstance(pair, (str, bytes)) or not isinstance(pair, tuple):
+            raise PLLInputError(
+                "pair: 需要长度为 2 的样本对 (z0, z1), "
+                f"得到 {type(pair).__name__}"
+            )
+        if len(pair) != 2:
+            raise PLLInputError(f"pair: 需要长度为 2, 得到长度 {len(pair)}")
+        coerced0 = _coerce_sample(pair[0])
+        coerced1 = _coerce_sample(pair[1])
+        return self._step_validated(coerced0, coerced1)
+
+    def _step_validated(self, z0, z1) -> DualRefDiagnostic:
+        t0, t1 = self._trackers
+        d0 = t0._step_validated(*z0)
+        d1 = t1._step_validated(*z1)
+        locked = (d0.locked, d1.locked)
+        valid = (d0.valid, d1.valid)
+
+        handoff = False
+
+        # 1) 挂起的切换目标已确认稳定:完成无扰动交接。
+        target = self._requested
+        if target is not None and locked[target] and valid[target]:
+            self._take_handoff(target)
+            handoff = True
+
+        active = self._selected
+        in_holdover_step = False
+
+        if not handoff and active is not None and (d0, d1)[active].valid:
+            # 2) 活动参考存在且本样本有效:输出随活动参考连续推进(偏置固定)。
+            tracker = (t0, t1)[active]
+            self._theta = wrap_phase(tracker.theta + self._offsets[active])
+            self._omega = tracker.omega
+        elif not handoff:
+            # 3) 活动参考缺失或本样本失效:优先接管已确认稳定且有效的
+            #    参考(挂起目标优先,其次任一路);没有则保持/捕获。
+            candidate = None
+            if target is not None and locked[target] and valid[target]:
+                candidate = target
+            elif active is None:
+                for ref in (0, 1):
+                    if locked[ref] and valid[ref]:
+                        candidate = ref
+                        break
+            # 注:active 非 None 但失效、且无挂起目标时不自动切到另一路,
+            # 必须等待活动参考重新确认(显式切换语义),此期间进入保持态。
+            if candidate is not None:
+                self._take_handoff(candidate)
+                handoff = True
+                active = self._selected
+            else:
+                if active is not None:
+                    self._selected = None  # 活动参考本样本失效
+                    active = None
+                if self._ever_locked:
+                    self._holdover += 1
+                    in_holdover_step = True
+
+        if active is not None:
+            mode = MODE_TRACKING
+        elif self._ever_locked:
+            # 曾有可信参考,当前参考失效且无稳定目标:保持态(不可信)。
+            mode = MODE_HOLDOVER
+        else:
+            # 自启动以来尚无任何参考确认锁定:捕获态(同样不可信)。
+            mode = MODE_ACQUIRING
+
+        self._processed += 1
+        return DualRefDiagnostic(
+            self._processed - 1, active, mode, active is not None,
+            handoff, self._requested, self._selected,
+            self._theta, self._omega,
+            d0.locked, d1.locked, d0.valid, d1.valid,
+            self._offsets[active] if active is not None else 0.0,
+            1 if in_holdover_step else 0,
+        )
+
+    def run(self, pairs) -> DualRefResult:
+        """处理一批样本对,返回结果快照。
+
+        先整批校验再逐对更新:任一样本非法时抛 PLLInputError,
+        交接器与两路 PLL 状态保持调用前原样(批次原子性)。
+        """
+        if isinstance(pairs, (str, bytes)):
+            raise PLLInputError("pairs: 需要样本对序列, 拒绝字符串")
+        try:
+            items = list(pairs)
+        except TypeError:
+            raise PLLInputError(
+                f"pairs: 需要可迭代序列, 得到 {type(pairs).__name__}"
+            ) from None
+        if len(items) > MAX_SAMPLES:
+            raise PLLInputError(
+                f"pairs: 单批最多 {MAX_SAMPLES} 个样本对, 得到 {len(items)}"
+            )
+        coerced = []
+        snap = self._snapshot()
+        try:
+            for i, pair in enumerate(items):
+                if isinstance(pair, (str, bytes)) or not isinstance(pair, tuple):
+                    raise PLLInputError(
+                        f"pairs[{i}]: 需要长度为 2 的样本对, "
+                        f"得到 {type(pair).__name__}"
+                    )
+                if len(pair) != 2:
+                    raise PLLInputError(
+                        f"pairs[{i}]: 需要长度为 2, 得到长度 {len(pair)}"
+                    )
+                coerced.append((_coerce_sample(pair[0]), _coerce_sample(pair[1])))
+            diags = [self._step_validated(z0, z1) for z0, z1 in coerced]
+        except BaseException:
+            self._restore(snap)
+            raise
+        return DualRefResult(
+            self._theta, self._omega, self._selected, self._requested,
+            self.mode, self.trusted, self._holdover, self._handoffs,
+            self._processed, tuple(diags),
         )
