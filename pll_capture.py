@@ -1,4 +1,4 @@
-"""整数采样数字锁相环(PLL)捕获诊断模块。
+"""整数采样数字锁相环(PLL)捕获诊断与双参考切换模块。
 
 基于合成复数导频的二阶离散 PLL。每个有效样本按如下顺序更新:
 
@@ -13,6 +13,13 @@
 连续 lock_count 个有效样本满足 |error| <= eps 时进入 locked;
 任一有效样本 |error| > eps 立即清零计数并退出 locked。
 
+ReferenceSwitcher 在相同采样速率的两路参考之间切换:
+新参考由独立的候选环路先行捕获,确认 locked 后才交接;
+交接瞬间输出相位取在用环路的当前相位(不跳变),
+频率字取候选环路的收敛估计,不叠加任何人为相位偏移,
+因此来回切换不会累积相位误差。目标参考未稳定时 complete_switch()
+拒绝交接并继续跟踪原参考;切换期间原参考失效时 locked 如实为 False。
+
 仅依赖 Python 标准库(math / dataclasses)。
 """
 
@@ -25,6 +32,7 @@ from typing import Optional, Tuple
 __all__ = [
     "PLLParams",
     "PLL",
+    "ReferenceSwitcher",
     "Diagnostic",
     "PLLResult",
     "PLLError",
@@ -314,3 +322,126 @@ class PLL:
             self._params, self._omega, self._theta, self.locked,
             self._streak, self._lost, self._processed, tuple(diags),
         )
+
+
+class ReferenceSwitcher:
+    """相同采样速率的两路参考之间的相位连续切换器。
+
+    - 在用环路跟踪当前参考;begin_switch() 后候选环路以在用环路的
+      当前 theta/omega 为初值,独立捕获新参考(两路采样速率相同,
+      频率字单位同为 rad/sample,可直接复用)。
+    - complete_switch() 仅当候选环路 locked 才交接:新在用环路
+      theta 取交接前在用环路的当前相位(输出相位不跳变),
+      omega 取候选环路的收敛估计。不注入任何人为相位偏移,
+      反复来回切换不会累积相位误差。
+    - 候选未稳定时 complete_switch() 返回 False,继续跟踪原参考。
+    - 切换期间原参考出现无效样本时,locked 如实变为 False,
+      status 报告 "switching",不假装仍锁定。
+    """
+
+    STATUS_LOCKED = "locked"
+    STATUS_ACQUIRING = "acquiring"
+    STATUS_SWITCHING = "switching"
+
+    def __init__(self, params: PLLParams, theta0: float = 0.0, omega0: float = 0.0):
+        self._active = PLL(params, theta0=theta0, omega0=omega0)
+        self._candidate: Optional[PLL] = None
+        self._switch_count = 0
+
+    # ---- 只读状态 ----
+    @property
+    def params(self) -> PLLParams:
+        return self._active.params
+
+    @property
+    def theta(self) -> float:
+        """输出相位(在用环路当前相位, rad, [-pi, pi))。"""
+        return self._active.theta
+
+    @property
+    def omega(self) -> float:
+        return self._active.omega
+
+    @property
+    def locked(self) -> bool:
+        """在用环路是否 locked;切换期间原参考失效时如实为 False。"""
+        return self._active.locked
+
+    @property
+    def switching(self) -> bool:
+        """是否处于切换过程(候选环路已启动、尚未交接或中止)。"""
+        return self._candidate is not None
+
+    @property
+    def candidate_locked(self) -> bool:
+        """候选环路是否已稳定锁定新参考。"""
+        return self._candidate is not None and self._candidate.locked
+
+    @property
+    def switch_count(self) -> int:
+        """已完成的交接次数。"""
+        return self._switch_count
+
+    @property
+    def status(self) -> str:
+        """可信状态: "locked" / "acquiring" / "switching"。"""
+        if self._candidate is not None:
+            return self.STATUS_SWITCHING
+        return self.STATUS_LOCKED if self._active.locked else self.STATUS_ACQUIRING
+
+    # ---- 在用参考(原参考)输入 ----
+    def step(self, z) -> Diagnostic:
+        """处理在用参考的单个样本。"""
+        return self._active.step(z)
+
+    def run(self, samples) -> PLLResult:
+        """处理在用参考的一批样本(批次原子性同 PLL.run)。"""
+        return self._active.run(samples)
+
+    # ---- 切换流程 ----
+    def begin_switch(self) -> None:
+        """启动切换:候选环路以在用环路当前 theta/omega 为初值,
+        开始独立跟踪新参考。重复调用会重新初始化候选环路。"""
+        self._candidate = PLL(
+            self._active.params,
+            theta0=self._active.theta,
+            omega0=self._active.omega,
+        )
+
+    def step_candidate(self, z) -> Diagnostic:
+        """向候选环路喂入新参考的单个样本。"""
+        if self._candidate is None:
+            raise PLLError("step_candidate: 尚未调用 begin_switch()")
+        return self._candidate.step(z)
+
+    def run_candidate(self, samples) -> PLLResult:
+        """向候选环路喂入新参考的一批样本。"""
+        if self._candidate is None:
+            raise PLLError("run_candidate: 尚未调用 begin_switch()")
+        return self._candidate.run(samples)
+
+    def complete_switch(self) -> bool:
+        """候选环路已稳定(locked)时完成交接并返回 True;
+        未稳定时返回 False,继续跟踪原参考,状态不变。
+
+        交接语义:新在用环路 omega 取候选环路的收敛估计,
+        theta 取交接前在用环路的当前相位,输出相位连续;
+        两路参考的真实相位差由环路按正常动态逐渐拉入,
+        不在交接瞬间跳变,也不累积人为偏移。
+        """
+        if self._candidate is None:
+            raise PLLError("complete_switch: 尚未调用 begin_switch()")
+        if not self._candidate.locked:
+            return False
+        self._active = PLL(
+            self._active.params,
+            theta0=self._active.theta,
+            omega0=self._candidate.omega,
+        )
+        self._candidate = None
+        self._switch_count += 1
+        return True
+
+    def abort_switch(self) -> None:
+        """放弃本次切换,丢弃候选环路,继续跟踪原参考。"""
+        self._candidate = None

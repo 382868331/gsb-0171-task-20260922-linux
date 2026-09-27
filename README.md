@@ -1,7 +1,8 @@
-# 整数采样数字锁相环(PLL)捕获诊断
+# 整数采样数字锁相环(PLL)捕获诊断与双参考切换
 
 基于合成复数导频的二阶离散 PLL 捕获模块,提供逐样本诊断、失锁冻结、
-任意分块一致处理与严格的输入校验。
+任意分块一致处理、严格的输入校验,以及相同采样速率两路参考之间的
+相位连续切换。
 
 ## 环境
 
@@ -44,6 +45,37 @@ result.frequency_offset(48000.0)             # 换算 Hz: omega * fs / (2*pi)
 - `Diagnostic`:`index, valid, amplitude, error, omega, theta, streak, locked, saturated`。
 - `PLLResult`:`params, omega, theta, locked, streak, lost_samples, processed, diagnostics`。
 - 同一实例可任意分块连续调用 `run()`/`step()`,与一次性处理**逐位一致**(浮点运算顺序相同)。
+
+## 双参考切换
+
+`ReferenceSwitcher` 在**相同采样速率**的两路参考之间切换(两路共用同一
+`PLLParams`,频率字单位同为 rad/sample):
+
+```python
+from pll_capture import ReferenceSwitcher
+
+sw = ReferenceSwitcher(params)
+sw.run(ref_a_samples)            # 在用环路跟踪原参考 A
+sw.begin_switch()                # 候选环路以当前 theta/omega 为初值, 独立捕获新参考 B
+sw.run_candidate(ref_b_samples)  # 新参考先独立跟踪
+sw.candidate_locked              # 目标参考是否已稳定
+sw.complete_switch()             # 稳定才交接 -> True; 未稳定 -> False, 继续用原参考
+```
+
+切换语义:
+
+- **先独立跟踪, 稳定才交接**:候选环路确认 `locked` 前,`complete_switch()`
+  返回 `False`,在用环路继续跟踪原参考,状态不变;`abort_switch()` 可放弃切换。
+- **输出相位不跳变**:交接瞬间新在用环路 `theta` 取交接前在用环路的当前相位,
+  `omega` 取候选环路的收敛估计;两路参考的真实相位差由环路按正常动态逐渐拉入。
+- **不累积人为偏移**:交接不注入任何相位修正量,反复来回切换后输出相位仍贴合
+  当前参考的真值相位(测试以 `<= 1e-3` rad 断言)。
+- **可信状态**:切换期间 `status == "switching"`;此时原参考失效(无效样本)会
+  如实使 `locked == False`,不假装仍锁定。
+- 属性:`theta / omega / locked / switching / candidate_locked / switch_count / status`
+  (`"locked"` / `"acquiring"` / `"switching"`)。
+- 未调用 `begin_switch()` 就执行候选相关操作会抛 `PLLError`;
+  候选输入的校验与批次原子性与 `PLL` 相同。
 
 ## 错误语义
 
@@ -90,6 +122,6 @@ PLL 状态保持调用前原样,不留部分变更。
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 单元测试(19 项)
-python demo.py                            # 捕获过程演示 + 非法输入拒绝, 约 0.1 秒
+python -m unittest discover -s tests -v   # 单元测试(26 项)
+python demo.py                            # 捕获 + 非法输入拒绝 + 双参考切换演示, 约 0.1 秒
 ```
